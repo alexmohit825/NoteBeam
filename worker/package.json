@@ -1,0 +1,16 @@
+{
+  "name": "notebeam-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Edge Relay for NoteBeam (Windows to iPhone Notes)",
+  "main": "src/index.ts",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^4.135.0"
+  }
+}

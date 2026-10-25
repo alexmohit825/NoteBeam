@@ -1,0 +1,8 @@
+{
+  "endpoint": "https://notebeam-relay.mohalex.workers.dev/api/beam",
+  "auth_token": "nb_mohit_sec_2026_beam",
+  "hotkey": "ctrl+alt+b",
+  "play_sound": true,
+  "show_toast": true,
+  "default_folder": "Quick Notes"
+}

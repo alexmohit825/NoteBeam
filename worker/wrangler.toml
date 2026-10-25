@@ -1,0 +1,11 @@
+name = "notebeam-relay"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[kv_namespaces]]
+binding = "NOTEBEAM_KV"
+id = "61dbf55703154c068e92aa17ffe5b2b9"
+
+[vars]
+AUTH_TOKEN = "nb_mohit_sec_2026_beam"
+NTFY_TOPIC = "notebeam-mohit-alerts"
