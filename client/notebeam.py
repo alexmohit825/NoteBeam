@@ -277,13 +277,18 @@ def dispatch_payload(payload: dict) -> dict:
 # Main Commands
 # -------------------------------------------------------------
 def beam_file(path_str: str):
+    import base64
     p = Path(path_str).resolve()
     if not p.exists():
         notify("NoteBeam Error", f"File not found: {p.name}")
         return False
 
     suffix = p.suffix.lower()
-    print(f"[*] Beaming document: {p.name}...")
+    print(f"[*] Beaming document/file: {p.name}...")
+
+    # Always read binary for attachment download
+    file_bytes = p.read_bytes()
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
 
     if suffix == ".docx":
         payload = parse_docx(p)
@@ -301,16 +306,27 @@ def beam_file(path_str: str):
             }
         }
     else:
-        notify("NoteBeam Error", f"Unsupported file type: {suffix}")
-        return False
+        # Binary file (PDF, image, zip, etc.)
+        payload = {
+            "title": p.name,
+            "markdown": f"**File Sent from PC:** {p.name}\n\n*Size: {len(file_bytes) / 1024:.1f} KB*",
+            "filename": p.name,
+            "stats": {
+                "words": 0,
+                "paragraphs": 1,
+                "characters": 0
+            }
+        }
 
+    payload["file_data"] = b64_data
+    payload["file_size"] = len(file_bytes)
     payload["timestamp"] = int(time.time() * 1000)
     payload["client"] = "NoteBeam-Windows-File"
 
     try:
         res = dispatch_payload(payload)
-        notify("⚡ NoteBeam Sent!", f"{payload['title']} ({payload['stats']['words']} words) is ready on your iPhone.")
-        print(f"[+] Successfully beamed '{payload['title']}' to Apple Notes relay.")
+        notify("⚡ NoteBeam Sent!", f"{p.name} is ready on your iPhone.")
+        print(f"[+] Successfully beamed '{p.name}' to iPhone relay.")
         return True
     except Exception as e:
         notify("NoteBeam Transfer Failed", str(e))

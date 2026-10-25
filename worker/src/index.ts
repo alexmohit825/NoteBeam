@@ -15,7 +15,11 @@ interface NotePayload {
     paragraphs: number;
     characters: number;
   };
+  file_data?: string; // base64 encoded for binary files
+  file_type?: string; // mime type
+  file_size?: number;
   timestamp: number;
+  direction: "pc_to_phone" | "phone_to_pc";
   client?: string;
 }
 
@@ -33,14 +37,16 @@ export default {
       return new Response(null, { headers: CORS_HEADERS });
     }
 
-    // Route: POST /api/beam
+    const expectedToken = env.AUTH_TOKEN || "nb_mohit_sec_2026_beam";
+
+    // ------------------------------------------------------------------
+    // ROUTE: POST /api/beam (PC -> iPhone)
+    // ------------------------------------------------------------------
     if (url.pathname === "/api/beam" && request.method === "POST") {
       const authHeader = request.headers.get("Authorization") || request.headers.get("X-NoteBeam-Key");
-      const expectedToken = env.AUTH_TOKEN || "nb_mohit_sec_2026_beam";
-
       const token = authHeader?.replace(/^Bearer\s+/i, "");
       if (token !== expectedToken) {
-        return new Response(JSON.stringify({ error: "Unauthorized. Invalid NoteBeam token." }), {
+        return new Response(JSON.stringify({ error: "Unauthorized." }), {
           status: 401,
           headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
         });
@@ -48,68 +54,30 @@ export default {
 
       try {
         const body = (await request.json()) as Partial<NotePayload>;
-        if (!body.title || !body.markdown) {
-          return new Response(JSON.stringify({ error: "Missing required fields: title and markdown." }), {
-            status: 400,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          });
-        }
-
         const note: NotePayload = {
           id: body.id || `nb_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          title: body.title,
-          markdown: body.markdown,
+          title: body.title || "Beamed Item",
+          markdown: body.markdown || "",
           html: body.html,
-          filename: body.filename || "Untitled.docx",
+          filename: body.filename || "Clipboard.txt",
+          file_data: body.file_data,
+          file_type: body.file_type || "text/plain",
+          file_size: body.file_size || (body.markdown ? body.markdown.length : 0),
           stats: body.stats || {
-            words: body.markdown.split(/\s+/).filter(Boolean).length,
-            paragraphs: body.markdown.split(/\n\s*\n/).filter(Boolean).length,
-            characters: body.markdown.length,
+            words: (body.markdown || "").split(/\s+/).filter(Boolean).length,
+            paragraphs: (body.markdown || "").split(/\n\s*\n/).filter(Boolean).length,
+            characters: (body.markdown || "").length,
           },
-          timestamp: body.timestamp || Date.now(),
-          client: body.client || "Windows-Desktop",
+          timestamp: Date.now(),
+          direction: "pc_to_phone",
+          client: body.client || "Windows-PC",
         };
 
-        // Save latest note and indexed note in KV
-        await env.NOTEBEAM_KV.put("latest_note", JSON.stringify(note));
-        await env.NOTEBEAM_KV.put(`note:${note.id}`, JSON.stringify(note), {
-          expirationTtl: 60 * 60 * 24 * 30, // 30 days retention
+        // Store latest PC->Phone item
+        await env.NOTEBEAM_KV.put("latest_pc_to_phone", JSON.stringify(note));
+        await env.NOTEBEAM_KV.put(`item:${note.id}`, JSON.stringify(note), {
+          expirationTtl: 60 * 60 * 24 * 7, // 7 days
         });
-
-        // Update recent index (last 20 notes)
-        try {
-          const recentRaw = await env.NOTEBEAM_KV.get("recent_index");
-          const recent: Array<{ id: string; title: string; filename: string; timestamp: number }> = recentRaw
-            ? JSON.parse(recentRaw)
-            : [];
-          const updated = [
-            { id: note.id, title: note.title, filename: note.filename, timestamp: note.timestamp },
-            ...recent.filter((r) => r.id !== note.id),
-          ].slice(0, 20);
-          await env.NOTEBEAM_KV.put("recent_index", JSON.stringify(updated));
-        } catch {
-          // Non-critical index update error
-        }
-
-        // Trigger Instant Push Notification via ntfy (if configured)
-        if (env.NTFY_TOPIC) {
-          try {
-            const host = url.origin;
-            await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
-              method: "POST",
-              headers: {
-                Title: `NoteBeam: ${note.title.substring(0, 50)}`,
-                Priority: "high",
-                Tags: "memo,inbox_tray",
-                Click: `${host}/view`,
-                Actions: `view, Open in Notes, shortcuts://run-shortcut?name=NoteBeam; view, Web Preview, ${host}/view`,
-              },
-              body: `Word doc "${note.filename}" ready to beam (${note.stats?.words || 0} words).`,
-            });
-          } catch (ntfyErr) {
-            console.error("ntfy dispatch error:", ntfyErr);
-          }
-        }
 
         return new Response(
           JSON.stringify({
@@ -117,50 +85,114 @@ export default {
             id: note.id,
             title: note.title,
             timestamp: note.timestamp,
-            message: "Note successfully beamed to edge relay.",
+            message: "Item successfully beamed to phone queue.",
           }),
-          {
-            status: 200,
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-          }
+          { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
         );
       } catch (err: any) {
-        return new Response(JSON.stringify({ error: err.message || "Failed to parse request" }), {
+        return new Response(JSON.stringify({ error: err.message }), {
           status: 500,
           headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
         });
       }
     }
 
-    // Route: GET /api/latest
-    if (url.pathname === "/api/latest" && request.method === "GET") {
-      const format = url.searchParams.get("format") || "json";
-      const token = url.searchParams.get("token");
-      const expectedToken = env.AUTH_TOKEN || "nb_mohit_sec_2026_beam";
+    // ------------------------------------------------------------------
+    // ROUTE: POST /api/phone-to-pc (iPhone -> PC)
+    // ------------------------------------------------------------------
+    if (url.pathname === "/api/phone-to-pc" && request.method === "POST") {
+      try {
+        const body = (await request.json()) as Partial<NotePayload>;
+        const item: NotePayload = {
+          id: body.id || `phone_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          title: body.title || "iPhone Upload",
+          markdown: body.markdown || "",
+          filename: body.filename || `iPhone_${Date.now()}.txt`,
+          file_data: body.file_data,
+          file_type: body.file_type || "text/plain",
+          file_size: body.file_size || (body.markdown ? body.markdown.length : 0),
+          timestamp: Date.now(),
+          direction: "phone_to_pc",
+          client: "iPhone-Safari",
+        };
 
-      // If token provided in query or header, validate (or allow public read if configured)
-      if (token && token !== expectedToken) {
-        return new Response("Unauthorized", { status: 401 });
-      }
+        // Save into pending queue for PC
+        const queueRaw = await env.NOTEBEAM_KV.get("queue_for_pc");
+        const queue: Array<NotePayload> = queueRaw ? JSON.parse(queueRaw) : [];
+        queue.push(item);
+        await env.NOTEBEAM_KV.put("queue_for_pc", JSON.stringify(queue.slice(-25)));
+        await env.NOTEBEAM_KV.put(`item:${item.id}`, JSON.stringify(item), {
+          expirationTtl: 60 * 60 * 24 * 7,
+        });
 
-      const raw = await env.NOTEBEAM_KV.get("latest_note");
-      if (!raw) {
-        if (format === "text" || format === "raw") {
-          return new Response("No notes beamed yet.", {
-            headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
-          });
-        }
-        return new Response(JSON.stringify({ success: false, message: "No notes beamed yet." }), {
-          status: 404,
+        return new Response(
+          JSON.stringify({ success: true, id: item.id, message: "Item queued for PC download." }),
+          { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+        );
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
           headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
         });
       }
+    }
+
+    // ------------------------------------------------------------------
+    // ROUTE: GET /api/pending-for-pc (PC polls this to auto-download)
+    // ------------------------------------------------------------------
+    if (url.pathname === "/api/pending-for-pc" && request.method === "GET") {
+      const authHeader = request.headers.get("Authorization") || url.searchParams.get("token");
+      const token = authHeader?.replace(/^Bearer\s+/i, "");
+      if (token !== expectedToken) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const queueRaw = await env.NOTEBEAM_KV.get("queue_for_pc");
+      const queue: Array<NotePayload> = queueRaw ? JSON.parse(queueRaw) : [];
+      return new Response(JSON.stringify({ success: true, items: queue }), {
+        status: 200,
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // ROUTE: POST /api/ack-pc/:id (PC acknowledges item downloaded)
+    // ------------------------------------------------------------------
+    if (url.pathname.startsWith("/api/ack-pc/") && request.method === "POST") {
+      const id = url.pathname.replace("/api/ack-pc/", "");
+      const queueRaw = await env.NOTEBEAM_KV.get("queue_for_pc");
+      if (queueRaw) {
+        const queue: Array<NotePayload> = JSON.parse(queueRaw);
+        const filtered = queue.filter((i) => i.id !== id);
+        await env.NOTEBEAM_KV.put("queue_for_pc", JSON.stringify(filtered));
+      }
+      return new Response(JSON.stringify({ success: true, acknowledged: id }), {
+        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // ROUTE: GET /api/latest (iPhone / Shortcut retrieves latest PC item)
+    // ------------------------------------------------------------------
+    if (url.pathname === "/api/latest" && request.method === "GET") {
+      const format = url.searchParams.get("format") || "json";
+      const raw = await env.NOTEBEAM_KV.get("latest_pc_to_phone");
+      if (!raw) {
+        return new Response(
+          format === "raw" ? "No notes beamed yet." : JSON.stringify({ success: false, message: "No notes beamed yet." }),
+          {
+            status: format === "raw" ? 200 : 404,
+            headers: {
+              ...CORS_HEADERS,
+              "Content-Type": format === "raw" ? "text/plain; charset=utf-8" : "application/json",
+            },
+          }
+        );
+      }
 
       const note: NotePayload = JSON.parse(raw);
-
-      if (format === "text" || format === "raw") {
-        // Ideal for iOS Shortcuts: Direct plain/markdown text
-        return new Response(note.markdown, {
+      if (format === "raw" || format === "text") {
+        return new Response(note.markdown || note.title, {
           headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
         });
       }
@@ -171,42 +203,13 @@ export default {
       });
     }
 
-    // Route: GET /api/notes
-    if (url.pathname === "/api/notes" && request.method === "GET") {
-      const recentRaw = await env.NOTEBEAM_KV.get("recent_index");
-      const recent = recentRaw ? JSON.parse(recentRaw) : [];
-      return new Response(JSON.stringify({ success: true, notes: recent }), {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
-
-    // Route: GET /api/note/:id
-    if (url.pathname.startsWith("/api/note/") && request.method === "GET") {
-      const id = url.pathname.replace("/api/note/", "");
-      const raw = await env.NOTEBEAM_KV.get(`note:${id}`);
-      if (!raw) {
-        return new Response(JSON.stringify({ error: "Note not found" }), {
-          status: 404,
-          headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-        });
-      }
-      return new Response(raw, {
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
-
-    // Route: GET / or /view (Mobile-Optimized Apple-Style Web UI)
+    // ------------------------------------------------------------------
+    // ROUTE: GET / or /view (Unified Responsive Bidirectional Web App)
+    // ------------------------------------------------------------------
     if (url.pathname === "/" || url.pathname === "/view") {
-      const raw = await env.NOTEBEAM_KV.get("latest_note");
+      const raw = await env.NOTEBEAM_KV.get("latest_pc_to_phone");
       const note: NotePayload | null = raw ? JSON.parse(raw) : null;
-      return new Response(renderWebUI(note, url.origin), {
-        headers: { "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
-
-    // Route: GET /shortcut (Setup & Shortcut Download Instructions)
-    if (url.pathname === "/shortcut") {
-      return new Response(renderShortcutGuide(url.origin), {
+      return new Response(renderBidirectionalApp(note, url.origin), {
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
     }
@@ -224,35 +227,38 @@ function escapeHtml(str: string): string {
     .replace(/'/g, "&#039;");
 }
 
-function renderWebUI(note: NotePayload | null, host: string): string {
-  const noteTitle = note ? escapeHtml(note.title) : "No Document Beamed Yet";
-  const noteDate = note ? new Date(note.timestamp).toLocaleString("en-US", { timeZone: "America/Los_Angeles" }) : "--";
-  const noteWords = note?.stats?.words || 0;
-  const noteFilename = note ? escapeHtml(note.filename) : "--";
-  const noteContent = note ? escapeHtml(note.markdown) : "Right-click any Word document on your Windows desktop and select 'NoteBeam: Send to iPhone Notes' to beam it here.";
+function renderBidirectionalApp(note: NotePayload | null, host: string): string {
+  const noteTitle = note ? escapeHtml(note.title) : "No Content Received Yet";
+  const noteFilename = note ? escapeHtml(note.filename) : "None";
+  const noteDate = note ? new Date(note.timestamp).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : "--";
+  const noteContent = note ? escapeHtml(note.markdown) : "Right-click any file on your PC or hit the Desktop NoteBeam button to send content here.";
+  const hasFile = Boolean(note?.file_data);
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>NoteBeam · Word to Apple Notes</title>
+  <title>NoteBeam · PC $\\leftrightarrow$ iPhone Bridge</title>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="theme-color" content="#0A84FF">
+  <meta name="apple-mobile-web-app-title" content="NoteBeam">
+  <meta name="theme-color" content="#0b0f19">
+  <link rel="apple-touch-icon" href="https://api.iconify.design/heroicons:bolt-solid.svg?color=%230A84FF">
   <style>
     :root {
       --bg: #0b0f19;
-      --card-bg: rgba(26, 32, 50, 0.75);
+      --card-bg: rgba(22, 28, 45, 0.75);
       --card-border: rgba(255, 255, 255, 0.08);
       --text: #f3f4f6;
       --text-muted: #9ca3af;
       --accent: #0A84FF;
       --accent-glow: rgba(10, 132, 255, 0.25);
       --green: #30D158;
-      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+      --purple: #AF52DE;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", sans-serif;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
     body {
       background: var(--bg);
       color: var(--text);
@@ -261,186 +267,128 @@ function renderWebUI(note: NotePayload | null, host: string): string {
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: env(safe-area-inset-top, 24px) 16px env(safe-area-inset-bottom, 24px);
+      padding: env(safe-area-inset-top, 20px) 16px env(safe-area-inset-bottom, 24px);
     }
-    .container {
-      width: 100%;
-      max-width: 640px;
-      margin: 0 auto;
-    }
+    .container { width: 100%; max-width: 580px; margin: 0 auto; }
     header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 16px 4px 20px;
+      padding: 12px 4px 16px;
     }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
+    .brand { display: flex; align-items: center; gap: 10px; }
     .brand-icon {
-      width: 36px;
-      height: 36px;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #0A84FF 0%, #5E5CE6 100%);
+      width: 38px; height: 38px; border-radius: 10px;
+      background: linear-gradient(135deg, #0A84FF 0%, #AF52DE 100%);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; box-shadow: 0 4px 14px var(--accent-glow);
+    }
+    .brand-title { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+    .brand-subtitle { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); font-weight: 600; }
+    
+    /* Segmented Tab Control */
+    .tab-bar {
       display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 20px;
-      box-shadow: 0 4px 12px var(--accent-glow);
-    }
-    .brand-title {
-      font-size: 20px;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-    }
-    .brand-subtitle {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--accent);
-      font-weight: 600;
-    }
-    .badge-live {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 20px;
-      background: rgba(48, 209, 88, 0.15);
-      color: var(--green);
-      font-size: 12px;
-      font-weight: 600;
-      border: 1px solid rgba(48, 209, 88, 0.3);
-    }
-    .pulse-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--green);
-      box-shadow: 0 0 8px var(--green);
-      animation: pulse 2s infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.85); }
-    }
-    .card {
-      background: var(--card-bg);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid var(--card-border);
-      border-radius: 18px;
-      padding: 20px;
-      margin-bottom: 16px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-    }
-    .doc-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      margin-bottom: 14px;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    .meta-tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      background: rgba(255, 255, 255, 0.05);
-      padding: 4px 8px;
-      border-radius: 6px;
-    }
-    h1.doc-title {
-      font-size: 22px;
-      font-weight: 700;
-      line-height: 1.3;
-      margin-bottom: 14px;
-      color: #fff;
-    }
-    .actions-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      padding: 13px 16px;
+      background: rgba(255, 255, 255, 0.06);
       border-radius: 12px;
+      padding: 3px;
+      margin-bottom: 16px;
+      border: 1px solid var(--card-border);
+    }
+    .tab-btn {
+      flex: 1;
+      padding: 10px 14px;
+      border-radius: 10px;
       font-size: 14px;
       font-weight: 600;
-      text-decoration: none;
-      cursor: pointer;
+      text-align: center;
       border: none;
-      transition: all 0.15s ease;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.2s ease;
       font-family: inherit;
+    }
+    .tab-btn.active {
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+    
+    .card {
+      background: var(--card-bg);
+      backdrop-filter: blur(25px);
+      -webkit-backdrop-filter: blur(25px);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+
+    .meta-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; font-size: 12px; color: var(--text-muted); }
+    .meta-pill {
+      background: rgba(255, 255, 255, 0.06);
+      padding: 4px 9px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px;
+    }
+
+    h2.title { font-size: 20px; font-weight: 700; margin-bottom: 14px; color: #fff; line-height: 1.3; }
+
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 14px 18px; border-radius: 14px; font-size: 15px;
+      font-weight: 600; text-decoration: none; cursor: pointer; border: none;
+      font-family: inherit; margin-bottom: 10px; transition: transform 0.1s ease, opacity 0.15s ease;
+    }
+    .btn:active { transform: scale(0.98); opacity: 0.9; }
+    .btn-notes {
+      background: linear-gradient(135deg, #FF9500 0%, #FF5E3A 100%);
+      color: #fff; box-shadow: 0 4px 16px rgba(255, 149, 0, 0.3);
     }
     .btn-primary {
       background: linear-gradient(135deg, #0A84FF 0%, #0060df 100%);
-      color: #fff;
-      box-shadow: 0 4px 14px var(--accent-glow);
-      grid-column: span 2;
+      color: #fff; box-shadow: 0 4px 14px var(--accent-glow);
     }
-    .btn-primary:active { transform: scale(0.98); opacity: 0.9; }
     .btn-secondary {
       background: rgba(255, 255, 255, 0.08);
-      color: var(--text);
-      border: 1px solid var(--card-border);
+      color: var(--text); border: 1px solid var(--card-border);
     }
-    .btn-secondary:active { background: rgba(255, 255, 255, 0.12); }
-    .content-box {
-      background: rgba(10, 14, 23, 0.6);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      border-radius: 12px;
-      padding: 16px;
-      max-height: 400px;
-      overflow-y: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 13px;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      word-break: break-word;
-      color: #d1d5db;
+
+    .preview-box {
+      background: rgba(10, 14, 23, 0.65);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 12px; padding: 16px;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      font-size: 13px; line-height: 1.6;
+      max-height: 280px; overflow-y: auto; white-space: pre-wrap;
+      word-break: break-word; color: #e5e7eb; margin-top: 14px;
     }
-    .setup-banner {
-      background: linear-gradient(135deg, rgba(10, 132, 255, 0.12) 0%, rgba(94, 92, 230, 0.12) 100%);
-      border: 1px solid rgba(10, 132, 255, 0.3);
-      border-radius: 16px;
-      padding: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
+
+    /* Outbox Tab (Send to PC) */
+    .upload-zone {
+      border: 2px dashed rgba(255, 255, 255, 0.18);
+      border-radius: 16px; padding: 24px 16px; text-align: center;
+      cursor: pointer; transition: border-color 0.2s ease; margin-bottom: 16px;
     }
-    .setup-text h3 { font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 2px; }
-    .setup-text p { font-size: 12px; color: var(--text-muted); }
-    .btn-sm {
-      padding: 8px 12px;
-      font-size: 12px;
-      border-radius: 8px;
-      background: var(--accent);
-      color: #fff;
-      text-decoration: none;
-      font-weight: 600;
-      white-space: nowrap;
+    .upload-zone:active { border-color: var(--accent); background: rgba(10, 132, 255, 0.05); }
+    .upload-icon { font-size: 36px; margin-bottom: 8px; }
+    .upload-title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+    .upload-hint { font-size: 12px; color: var(--text-muted); }
+
+    textarea.input-box {
+      width: 100%; height: 110px; background: rgba(10, 14, 23, 0.65);
+      border: 1px solid var(--card-border); border-radius: 12px;
+      padding: 12px; color: #fff; font-family: inherit; font-size: 14px;
+      resize: none; outline: none; margin-bottom: 12px;
     }
+    textarea.input-box:focus { border-color: var(--accent); }
+
     .toast {
-      position: fixed;
-      bottom: 20px;
-      left: 50%;
+      position: fixed; bottom: 24px; left: 50%;
       transform: translateX(-50%) translateY(100px);
-      background: #10b981;
-      color: white;
-      padding: 10px 18px;
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 600;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      background: #10b981; color: white; padding: 12px 22px;
+      border-radius: 30px; font-size: 14px; font-weight: 600;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
       transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
       z-index: 100;
     }
@@ -454,200 +402,220 @@ function renderWebUI(note: NotePayload | null, host: string): string {
         <div class="brand-icon">⚡</div>
         <div>
           <div class="brand-title">NoteBeam</div>
-          <div class="brand-subtitle">Word $\to$ Apple Notes</div>
+          <div class="brand-subtitle">PC $\\leftrightarrow$ iPhone Bridge</div>
         </div>
       </div>
-      <div class="badge-live">
-        <span class="pulse-dot"></span>
-        <span>Edge Relay Live</span>
-      </div>
+      <button class="meta-pill" onclick="refreshContent()" style="cursor:pointer; border:none; background:rgba(255,255,255,0.1); color:#fff;">
+        🔄 Refresh
+      </button>
     </header>
 
-    <div class="card">
-      <div class="doc-meta">
-        <span class="meta-tag">📄 ${noteFilename}</span>
-        <span class="meta-tag">📝 ${noteWords} words</span>
-        <span class="meta-tag">🕒 ${noteDate}</span>
-      </div>
-
-      <h1 class="doc-title">${noteTitle}</h1>
-
-      <div class="actions-grid">
-        <button class="btn btn-primary" onclick="openInAppleNotes()">
-          <span>📱</span> Create in Apple Notes (Shortcut)
-        </button>
-        <button class="btn btn-secondary" onclick="copyNoteContent()">
-          <span>📋</span> Copy All Text
-        </button>
-        <button class="btn btn-secondary" onclick="shareNote()">
-          <span>📤</span> Native Share Sheet
-        </button>
-      </div>
-
-      <div class="content-box" id="note-body">${noteContent}</div>
+    <div class="tab-bar">
+      <button class="tab-btn active" id="tab-inbox" onclick="switchTab('inbox')">📥 Received from PC</button>
+      <button class="tab-btn" id="tab-outbox" onclick="switchTab('outbox')">📤 Send to PC</button>
     </div>
 
-    <div class="setup-banner">
-      <div class="setup-text">
-        <h3>Install 1-Tap iOS Shortcut</h3>
-        <p>Enables 1-click notification $\to$ Apple Notes import</p>
+    <!-- TAB 1: INCOMING FROM PC -->
+    <div id="view-inbox">
+      <div class="card">
+        <div class="meta-row">
+          <span class="meta-pill">🕒 ${noteDate}</span>
+          <span class="meta-pill">📄 ${noteFilename}</span>
+        </div>
+
+        <h2 class="title" id="note-title">${noteTitle}</h2>
+
+        <!-- HERO ACTION 1: SEND DIRECT TO APPLE NOTES -->
+        <button class="btn btn-notes" onclick="saveToAppleNotes()">
+          <span>📝</span> <strong>Save to Apple Notes</strong>
+        </button>
+
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+          <button class="btn btn-secondary" onclick="copyNoteText()">
+            <span>📋</span> Copy Text
+          </button>
+          <button class="btn btn-secondary" onclick="shareNativeSheet()">
+            <span>📤</span> iOS Share
+          </button>
+        </div>
+
+        ${
+          hasFile
+            ? `<button class="btn btn-primary" onclick="downloadAttachment()" style="margin-top:4px;">
+                <span>💾</span> Download Attachment (${noteFilename})
+               </button>`
+            : ""
+        }
+
+        <div class="preview-box" id="preview-text">${noteContent}</div>
       </div>
-      <a href="/shortcut" class="btn-sm">Setup Guide $\to$</a>
+    </div>
+
+    <!-- TAB 2: SEND TO PC -->
+    <div id="view-outbox" style="display: none;">
+      <div class="card">
+        <h2 class="title">Drop to Your PC</h2>
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px;">
+          Photos, documents, or text sent here automatically download into your PC's <strong>Downloads\\NoteBeam</strong> folder with an instant Windows chime!
+        </p>
+
+        <!-- FILE / PHOTO DROP ZONE -->
+        <label class="upload-zone" for="file-input" style="display:block;">
+          <div class="upload-icon">📁</div>
+          <div class="upload-title">Select Photo, PDF, or Document</div>
+          <div class="upload-hint">Uploads directly to your PC desktop</div>
+          <input type="file" id="file-input" multiple onchange="uploadFilesToPC(this)" style="display:none;">
+        </label>
+
+        <!-- TEXT / DICTATION BOX -->
+        <div style="font-size: 13px; font-weight:600; margin-bottom: 6px;">Or Beam Text Directly to PC Clipboard:</div>
+        <textarea class="input-box" id="phone-text-input" placeholder="Type or dictate a note to beam to your PC clipboard..."></textarea>
+        <button class="btn btn-primary" onclick="sendTextToPC()">
+          <span>⚡</span> Beam Text to PC Clipboard
+        </button>
+      </div>
     </div>
   </div>
 
-  <div class="toast" id="toast">Copied to clipboard!</div>
+  <div class="toast" id="toast">Saved!</div>
 
   <script>
     const noteRaw = ${JSON.stringify(note?.markdown || "")};
-    const noteTitle = ${JSON.stringify(note?.title || "NoteBeam Document")};
+    const noteTitleText = ${JSON.stringify(note?.title || "NoteBeam Note")};
+    const fileDataBase64 = ${JSON.stringify(note?.file_data || "")};
+    const fileMime = ${JSON.stringify(note?.file_type || "application/octet-stream")};
+    const filenameStr = ${JSON.stringify(note?.filename || "download")};
 
     function showToast(msg) {
       const t = document.getElementById('toast');
       t.innerText = msg;
       t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 2200);
+      setTimeout(() => t.classList.remove('show'), 2400);
     }
 
-    function copyNoteContent() {
-      if (!noteRaw) return showToast('No document content to copy');
+    function switchTab(tab) {
+      document.getElementById('view-inbox').style.display = tab === 'inbox' ? 'block' : 'none';
+      document.getElementById('view-outbox').style.display = tab === 'outbox' ? 'block' : 'none';
+      document.getElementById('tab-inbox').classList.toggle('active', tab === 'inbox');
+      document.getElementById('tab-outbox').classList.toggle('active', tab === 'outbox');
+    }
+
+    function refreshContent() {
+      window.location.reload();
+    }
+
+    // 1-TAP SAVE TO APPLE NOTES
+    function saveToAppleNotes() {
+      if (!noteRaw) return showToast("No text to save");
+
+      // Method 1: Web Share API (Triggers native iOS Notes sheet)
+      if (navigator.share) {
+        navigator.share({
+          title: noteTitleText,
+          text: noteRaw
+        }).catch(() => {
+          fallbackCopyToNotes();
+        });
+      } else {
+        fallbackCopyToNotes();
+      }
+    }
+
+    function fallbackCopyToNotes() {
       navigator.clipboard.writeText(noteRaw).then(() => {
-        showToast('✓ Copied to clipboard! Paste into Notes');
+        showToast("✓ Copied! Opening Notes...");
+        setTimeout(() => {
+          window.location.href = "mobilenotes://";
+        }, 400);
       });
     }
 
-    function openInAppleNotes() {
-      // 1. Trigger native iOS Shortcut deep link
-      window.location.href = 'shortcuts://run-shortcut?name=NoteBeam';
-      setTimeout(() => {
-        // Fallback: If shortcut not installed, copy to clipboard
-        navigator.clipboard.writeText(noteRaw);
-        showToast('Opening Shortcut... (Content copied to clipboard)');
-      }, 500);
+    function copyNoteText() {
+      navigator.clipboard.writeText(noteRaw).then(() => {
+        showToast("✓ Copied text to clipboard!");
+      });
     }
 
-    function shareNote() {
+    function shareNativeSheet() {
       if (navigator.share) {
         navigator.share({
-          title: noteTitle,
-          text: noteRaw,
+          title: noteTitleText,
+          text: noteRaw
         }).catch(() => {});
       } else {
-        copyNoteContent();
+        copyNoteText();
       }
     }
+
+    function downloadAttachment() {
+      if (!fileDataBase64) return;
+      const a = document.createElement('a');
+      a.href = "data:" + fileMime + ";base64," + fileDataBase64;
+      a.download = filenameStr;
+      a.click();
+    }
+
+    // PHONE -> PC: SEND TEXT
+    async function sendTextToPC() {
+      const input = document.getElementById('phone-text-input');
+      const text = input.value.trim();
+      if (!text) return showToast("Enter text first");
+
+      showToast("⏳ Beaming to PC...");
+      try {
+        const resp = await fetch('/api/phone-to-pc', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: text.substring(0, 40),
+            markdown: text,
+            filename: "Phone_Snippet.txt",
+            file_type: "text/plain"
+          })
+        });
+        const res = await resp.json();
+        if (res.success) {
+          input.value = "";
+          showToast("✓ Beamed to PC Clipboard!");
+        }
+      } catch (err) {
+        alert("Transfer failed: " + err.message);
+      }
+    }
+
+    // PHONE -> PC: UPLOAD FILES / PHOTOS
+    async function uploadFilesToPC(input) {
+      if (!input.files || input.files.length === 0) return;
+      const file = input.files[0];
+      showToast("⏳ Uploading " + file.name + " to PC...");
+
+      const reader = new FileReader();
+      reader.onload = async function() {
+        const base64Data = reader.result.split(',')[1];
+        try {
+          const resp = await fetch('/api/phone-to-pc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: file.name,
+              filename: file.name,
+              file_type: file.type || "application/octet-stream",
+              file_size: file.size,
+              file_data: base64Data
+            })
+          });
+          const res = await resp.json();
+          if (res.success) {
+            showToast("✓ Sent to PC! (Saved in Downloads)");
+            input.value = "";
+          }
+        } catch (err) {
+          alert("Upload failed: " + err.message);
+        }
+      };
+      reader.readAsDataURL(file);
+    }
   </script>
-</body>
-</html>`;
-}
-
-function renderShortcutGuide(host: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>NoteBeam · iOS Shortcut Setup</title>
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --card: rgba(26, 32, 50, 0.75);
-      --accent: #0A84FF;
-      --text: #f3f4f6;
-      --muted: #9ca3af;
-      --border: rgba(255, 255, 255, 0.08);
-      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--font);
-      padding: 24px 16px;
-      display: flex;
-      justify-content: center;
-    }
-    .wrap { max-width: 540px; width: 100%; }
-    h1 { font-size: 24px; margin-bottom: 8px; font-weight: 700; }
-    p.lead { color: var(--muted); font-size: 14px; margin-bottom: 24px; line-height: 1.5; }
-    .step {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 16px;
-      margin-bottom: 14px;
-    }
-    .step-num {
-      display: inline-block;
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      background: var(--accent);
-      color: #fff;
-      font-size: 12px;
-      font-weight: 700;
-      text-align: center;
-      line-height: 24px;
-      margin-bottom: 8px;
-    }
-    .step h3 { font-size: 15px; margin-bottom: 4px; font-weight: 600; }
-    .step p { font-size: 13px; color: var(--muted); line-height: 1.4; }
-    .code {
-      background: rgba(0,0,0,0.4);
-      padding: 8px 10px;
-      border-radius: 8px;
-      font-family: monospace;
-      font-size: 12px;
-      color: #38bdf8;
-      margin-top: 8px;
-      word-break: break-all;
-    }
-    .btn {
-      display: block;
-      width: 100%;
-      text-align: center;
-      background: var(--accent);
-      color: #fff;
-      padding: 12px;
-      border-radius: 12px;
-      text-decoration: none;
-      font-weight: 600;
-      margin-top: 20px;
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>NoteBeam iOS Shortcut</h1>
-    <p class="lead">Connects your iPhone Apple Notes directly to your Windows desktop beam stream.</p>
-
-    <div class="step">
-      <div class="step-num">1</div>
-      <h3>Open Apple Shortcuts App</h3>
-      <p>Create a new shortcut on your iPhone named exactly <strong>NoteBeam</strong>.</p>
-    </div>
-
-    <div class="step">
-      <div class="step-num">2</div>
-      <h3>Action 1: Get Contents of URL</h3>
-      <p>Add the action <strong>"Get Contents of URL"</strong> and paste this exact endpoint:</p>
-      <div class="code">${host}/api/latest?format=raw</div>
-    </div>
-
-    <div class="step">
-      <div class="step-num">3</div>
-      <h3>Action 2: Create Note</h3>
-      <p>Add the action <strong>"Create Note with [Contents of URL] in [Notes]"</strong> (turn off "Show When Run" for 1-tap instant save).</p>
-    </div>
-
-    <div class="step">
-      <div class="step-num">4</div>
-      <h3>Done!</h3>
-      <p>Whenever you right-click any Word document on Windows and click "NoteBeam", tapping the alert on your iPhone or tapping this shortcut will instantly create the formatted note.</p>
-    </div>
-
-    <a href="/view" class="btn">$\leftarrow$ Back to Note View</a>
-  </div>
 </body>
 </html>`;
 }
