@@ -448,9 +448,6 @@ function renderBidirectionalApp(note: NotePayload | null, host: string): string 
           <div class="brand-subtitle">PC $\\leftrightarrow$ iPhone Bridge</div>
         </div>
       </div>
-      <button class="meta-pill" onclick="refreshContent()" style="cursor:pointer; border:none; background:rgba(255,255,255,0.1); color:#fff;">
-        🔄 Refresh
-      </button>
     </header>
 
     <div class="tab-bar">
